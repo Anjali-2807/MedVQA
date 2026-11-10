@@ -1,0 +1,52 @@
+cat > .gitignore <<'EOF'
+# Python environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Datasets
+data/
+*.arrow
+*.zip
+
+# Model checkpoints and weights
+ckpts/
+downloaded/
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# Training outputs
+result/
+wandb/
+lightning_logs/
+*.tfevents*
+
+# LAVIS: cloned and prepared by run_local_training.py
+LAVIS/
+
+# Secrets
+.env
+.env.*
+
+# OS files
+.DS_Store
+
+# Generated files
+repo_code.txt
+
+# IDE
+.idea/
+
+EOF
+# Editor temporary files
+*.swp
+*.swo
+*~

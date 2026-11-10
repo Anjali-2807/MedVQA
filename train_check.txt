@@ -1,0 +1,2354 @@
+==> main.py <==
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+
+import copy
+import os
+import resource
+
+import pytorch_lightning as pl
+# from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+
+from m3ae.config import ex
+from m3ae.datamodules.multitask_datamodule import MTDataModule
+from m3ae.modules import M3AETransformerSS
+
+# from m3ae.datasets.ROCO import ROCOFeatureDataset
+# from torch.utils.data import DataLoader
+
+rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (4096, rlimit[1]))
+
+
+@ex.automain
+def main(_config):
+    _config = copy.deepcopy(_config)  # 创建_config的深拷贝，以避免在后续操作中对原数据的修改
+    pl.seed_everything(_config["seed"])
+
+    # Data modules
+    dm = MTDataModule(_config, dist=True)
+
+    # retrieval
+    # 创建检索数据集
+    # retrieval_function = None
+    # if "retrieval" in _config and _config["retrieval"]:
+    #     # if "retrieval_dataset" in _config:
+    #     retrieval_dataset = ROCOFeatureDataset("train", _config['retrieval_data'], device=f"cuda:{_config['gpu_ids']}")
+    #     # retrieval_dataset = ROCOFeatureDataset("train", _config['retrieval_data'], device="cpu")
+    #     # retrieval_dataset = load_dataset(_config["datafolder"], _config["retrieval_dataset"], "train", device)
+    #     retrieval_loader = DataLoader(retrieval_dataset, _config["retrieval_batch"], shuffle=True, num_workers=2)
+    #
+    #     if "k" in _config:
+    #         k = _config["k"]
+    #     else:
+    #         k = 15
+    #
+    #     print(f"Using {k}-nn retrieval from {retrieval_dataset.dataroot} with only training data ...")
+    #     retrieval_dataset.create_retrieval_dataset(retrieval_loader, is_training_phase=True, retrieval_k=k)
+    #     retrieval_function = retrieval_dataset.retrieve_closest_qa_pairs
+
+    # Module
+    model = M3AETransformerSS(_config)  # 网络模块初始化
+    # model.set_retrieval_function(retrieval_function)
+    # print(model)
+
+    # Loggers
+    os.makedirs(_config["log_dir"], exist_ok=True)
+    exp_name = f'{_config["exp_name"]}'
+    run_name = f'{exp_name}-seed{_config["seed"]}-from_{_config["load_path"].replace("/", "_")}'
+    tb_logger = pl.loggers.TensorBoardLogger(_config["log_dir"], name=run_name)
+    # wb_logger = pl.loggers.WandbLogger(project="MICCAI-M3AE", name=run_name)
+    loggers = [tb_logger]
+
+    # Callback
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        save_top_k=1,
+        verbose=True,
+        monitor="val/the_metric",
+        mode="max",
+        save_last=True,
+        save_weights_only=True if "finetune" in exp_name else False
+    )  # 创建回调函数，保存最佳模型
+    lr_callback = pl.callbacks.LearningRateMonitor(logging_interval="step")
+    callbacks = [checkpoint_callback, lr_callback]
+
+    # Training Hyper-Parameters
+    num_gpus = (_config["num_gpus"] if isinstance(_config["num_gpus"], int) else len(_config["num_gpus"]))
+    # print(_config)
+    gpu_ids = (_config['gpu_ids'])
+    grad_steps = max(_config["batch_size"] // (_config["per_gpu_batchsize"] * num_gpus * _config["num_nodes"]), 1)
+    max_steps = _config["max_steps"] if _config["max_steps"] is not None else None
+    max_epochs = _config["max_epoch"] if max_steps is None else 1000
+
+    # Trainer
+    trainer = pl.Trainer(
+        accelerator="cpu",  # Use "mps" if your Mac supports it well, or "cpu" for compatibility
+        devices=1,
+        num_nodes=_config["num_nodes"],
+        precision=_config["precision"],
+        benchmark=True,
+        deterministic=True,
+        max_epochs=max_epochs,
+        max_steps=max_steps if max_steps is not None else -1,
+        callbacks=callbacks,
+        logger=loggers,
+        accumulate_grad_batches=grad_steps,
+        log_every_n_steps=10,
+        fast_dev_run=_config["fast_dev_run"],
+        val_check_interval=_config["val_check_interval"],
+        default_root_dir=_config["default_root_dir"]
+    )  # 初始化训练器
+
+    if not _config["test_only"]:
+        trainer.fit(model, datamodule=dm)
+        if "finetune" in exp_name:
+            trainer.test(model, datamodule=dm)
+    else:
+        trainer.test(model, datamodule=dm)
+        # get_cam(model)
+
+==> m3ae/config.py <==
+from sacred import Experiment
+
+ex = Experiment("METER", save_git_info=False)
+
+
+def _loss_names(d):
+    ret = {
+        "mlm": 0,
+        "mim": 0,
+        "itm": 0,
+        "vqa": 0,
+        "vqa_close": 0,
+        "vqa_open": 0,
+        "vqahead": 0,
+        "itc": 0,
+        "cls": 0,
+        "irtr": 0,
+    }
+    ret.update(d)
+    return ret
+
+
+@ex.config
+def config():
+    exp_name = "meter"
+    seed = 0
+    datasets = ["medicat", "roco"]
+    loss_names = _loss_names({"itm": 1, "mlm": 1})
+    batch_size = 4096
+    gpu_ids = 1
+
+    # Image setting
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    image_size = 224
+    patch_size = 32
+    draw_false_image = 1
+    image_only = False
+
+    # Text Setting
+    vqa_label_size = 3129
+    closed_label_size = 3129
+    open_label_size = 3129
+    mlc_label_size = 14
+    max_text_len = 40
+    tokenizer = "bert-base-uncased"
+    vocab_size = 30522
+    whole_word_masking = True
+    mlm_prob = 0.15
+    draw_false_text = 0
+
+    # Answer Generation Setting
+    T5_model = "downloaded/t5-base"
+
+    # Transformer Setting
+    num_top_layer = 6
+    input_image_embed_size = 768
+    input_text_embed_size = 768
+    vit = 'ViT-B/32'
+    hidden_size = 768
+    num_heads = 12
+    num_layers = 6
+    mlp_ratio = 4
+    drop_rate = 0.1
+
+    # MIM decoder Setting
+    mim_prob = 0.75
+    mim_decoder_hidden_size = 384
+    mim_decoder_num_layers = 4
+    mim_decoder_num_heads = 6
+    norm_pix_loss = True
+    mim_layer = -1
+
+    # Optimizer Setting
+    optim_type = "adamw"
+    learning_rate = 1e-5
+    weight_decay = 0.01
+    decay_power = 1
+    max_epoch = 100
+    max_steps = 100000
+    warmup_steps = 10000
+    end_lr = 0
+    lr_multiplier_head = 5  # multiply lr for prediction heads
+    lr_multiplier_multi_modal = 5  # multiply lr for the multi-modal module
+
+    # Momentum Contrast Setting
+    temp = 0.07
+    rad_queue_size = 81920  # vqa_rad=81920
+    queue_size = 81920
+    momentum = 0.995
+    alpha = 0.4
+    embed_dim = 256
+
+    # Downstream Setting
+    get_recall_metric = False
+
+    # PL Trainer Setting
+    resume_from = None
+    fast_dev_run = False
+    val_check_interval = 1.0
+    test_only = False
+    default_root_dir = "checkpoints"
+
+    # below params varies with the environment
+    data_root = ""
+    log_dir = "result"
+    per_gpu_batchsize = 0
+    num_gpus = 8
+    num_nodes = 1
+    load_path = ""
+    num_workers = 8
+    precision = 16
+
+    # MELINDA SETTING
+    label_column_name = ""
+    melinda_label_size = {"i_meth": 85, "p_meth": 45, "i_meth_label": 15, "p_meth_label": 7}
+
+    # LaPA model
+    latent_prompt_size = 32
+    ans_token_path = ""
+    ans_tokenizer_dict_path = ""
+    adj_feat_path = "data/external_data/adj_matrix.pt"
+    organ_disease_feat = "data/external_data/organ_disease_info.pt"
+
+    # Retrieval
+    retrieval = True
+    retrieval_data = '/data/qgking/zxy/MultimodalPromptRetrieval-main/data/ROCO'
+    retrieval_batch = 8
+    k = 1
+
+@ex.named_config
+def task_pretrain_m3ae():
+    exp_name = "task_pretrain_m3ae"
+    datasets = ["medicat", "roco"]
+    loss_names = _loss_names({"itm": 1, "mlm": 1, "mim": 1})
+    batch_size = 256
+    max_epoch = 10
+    max_steps = 100000
+    warmup_steps = 0.1
+    whole_word_masking = True
+
+    vocab_size = 30522
+    max_text_len = 64
+    image_size = 224
+    tokenizer = "bert-base-uncased"
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    learning_rate = 1e-5
+    val_check_interval = 1.0
+    lr_multiplier_head = 5
+    lr_multiplier_multi_modal = 5
+    num_top_layer = 6
+    hidden_size = 768
+    num_heads = 12
+
+    precision = 16
+    mim_layer = 3
+
+
+@ex.named_config
+def task_finetune_vqa_vqa_rad():
+    exp_name = "task_finetune_vqa_vqa_rad"
+    datasets = ["vqa_vqa_rad"]
+    loss_names = _loss_names({"vqa": 1})
+    batch_size = 64
+    max_epoch = 50
+    max_steps = None
+    warmup_steps = 0.1
+    draw_false_image = 0
+    learning_rate = 5e-6
+    val_check_interval = 1.0
+    lr_multiplier_head = 50
+    lr_multiplier_multi_modal = 5
+    tokenizer = "bert-base-uncased"
+    max_text_len = 32
+    input_text_embed_size = 768
+    vit = 'ViT-B/32'
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+    image_size = 576
+    queue_size = 65536
+
+    vqa_label_size = 498
+    closed_label_size = 63
+    open_label_size = 465
+
+@ex.named_config
+def task_finetune_vqa_ovqa():
+    exp_name = "task_finetune_vqa_ovqa"
+    datasets = ["vqa_ovqa"]
+    loss_names = _loss_names({"vqa": 1})
+    batch_size = 64
+    max_epoch = 50
+    max_steps = None
+    warmup_steps = 0.1
+    draw_false_image = 0
+    learning_rate = 5e-6
+    val_check_interval = 1.0
+    lr_multiplier_head = 50
+    lr_multiplier_multi_modal = 5
+    tokenizer = "bert-base-uncased"
+    max_text_len = 128
+    input_text_embed_size = 768
+    vit = 'ViT-B/32'
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+    image_size = 576
+    queue_size = 65536
+
+    vqa_label_size = 699
+
+
+@ex.named_config
+def task_finetune_vqa_slack():
+    exp_name = "task_finetune_vqa_slack"
+    datasets = ["vqa_slack"]
+    loss_names = _loss_names({"vqa": 1})
+    batch_size = 32
+    max_epoch = 50
+    max_steps = None
+    warmup_steps = 0.1
+    draw_false_image = 0
+    learning_rate = 5e-6
+    val_check_interval = 1.0
+    lr_multiplier_head = 50
+    lr_multiplier_multi_modal = 5
+    tokenizer = "bert-base-uncased"
+    max_text_len = 32
+    input_text_embed_size = 768
+    vit = 'ViT-B/32'
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+    image_size = 576
+    queue_size = 65536
+
+    vqa_label_size = 222 # num_class 220
+
+
+@ex.named_config
+def task_finetune_vqa_medvqa_2019():
+    exp_name = "task_finetune_vqa_medvqa_2019"
+    datasets = ["vqa_medvqa_2019"]
+    loss_names = _loss_names({"vqa": 1})
+    batch_size = 32
+    max_epoch = 10
+    max_steps = None
+    warmup_steps = 0.1
+    draw_false_image = 0
+    learning_rate = 5e-6
+    val_check_interval = 1.0
+    lr_multiplier_head = 50
+    lr_multiplier_multi_modal = 5
+    tokenizer = "bert-base-uncased"
+    max_text_len = 32
+    input_text_embed_size = 768
+    vit = 'ViT-B/32'
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+    image_size = 576
+
+    vqa_label_size = 79
+
+
+@ex.named_config
+def task_finetune_cls_melinda_i_meth():
+    exp_name = "task_finetune_cls_melinda_i_meth"
+    datasets = ["cls_melinda"]
+    loss_names = _loss_names({"cls": 1})
+    batch_size = 16
+    max_epoch = 20
+    max_steps = None
+    warmup_steps = 0.1
+    draw_false_image = 0
+    learning_rate = 5e-6
+    lr_multiplier_head = 10
+    lr_multiplier_multi_modal = 5
+    tokenizer = "bert-base-uncased"
+    max_text_len = 128
+    input_text_embed_size = 768
+    vit = 'ViT-B/32'
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+    image_size = 384
+
+    label_column_name = "i_meth"
+
+
+@ex.named_config
+def task_finetune_cls_melinda_i_meth_label():
+    exp_name = "task_finetune_cls_melinda_i_meth_label"
+    datasets = ["cls_melinda"]
+    loss_names = _loss_names({"cls": 1})
+    batch_size = 16
+    max_epoch = 20
+    max_steps = None
+    warmup_steps = 0.1
+    draw_false_image = 0
+    learning_rate = 5e-6
+    lr_multiplier_head = 10
+    lr_multiplier_multi_modal = 5
+    tokenizer = "bert-base-uncased"
+    max_text_len = 128
+    input_text_embed_size = 768
+    vit = 'ViT-B/32'
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+    image_size = 384
+
+    label_column_name = "i_meth_label"
+
+
+@ex.named_config
+def task_finetune_cls_melinda_p_meth():
+    exp_name = "task_finetune_cls_melinda_p_meth"
+    datasets = ["cls_melinda"]
+    loss_names = _loss_names({"cls": 1})
+    batch_size = 16
+    max_epoch = 20
+    max_steps = None
+    warmup_steps = 0.1
+    draw_false_image = 0
+    learning_rate = 5e-6
+    lr_multiplier_head = 10
+    lr_multiplier_multi_modal = 5
+    tokenizer = "bert-base-uncased"
+    max_text_len = 128
+    input_text_embed_size = 768
+    vit = 'ViT-B/32'
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+    image_size = 384
+
+    label_column_name = "p_meth"
+
+
+@ex.named_config
+def task_finetune_cls_melinda_p_meth_label():
+    exp_name = "task_finetune_cls_melinda_p_meth_label"
+    datasets = ["cls_melinda"]
+    loss_names = _loss_names({"cls": 1})
+    batch_size = 16
+    max_epoch = 20
+    max_steps = None
+    warmup_steps = 0.1
+    draw_false_image = 0
+    learning_rate = 5e-6
+    lr_multiplier_head = 10
+    lr_multiplier_multi_modal = 5
+    tokenizer = "bert-base-uncased"
+    max_text_len = 128
+    input_text_embed_size = 768
+    vit = 'ViT-B/32'
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+    image_size = 384
+
+    label_column_name = "p_meth_label"
+
+
+@ex.named_config
+def task_finetune_irtr_roco():
+    exp_name = "task_finetune_irtr_roco"
+    datasets = ["irtr_roco"]
+    loss_names = _loss_names({"irtr": 1})
+    batch_size = 256
+    max_epoch = 10
+    max_steps = None
+    warmup_steps = 0.1
+    get_recall_metric = True
+    draw_false_text = 15
+    learning_rate = 5e-6
+    lr_multiplier_head = 5
+    lr_multiplier_multi_modal = 5
+    tokenizer = "bert-base-uncased"
+    input_text_embed_size = 768
+    vit = 'ViT-B/32'
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+    image_size = 384
+
+
+# Named configs for "etc" which are orthogonal to "env" and "task", need to be added at the end
+
+# vision encoder
+@ex.named_config
+def swin32_base224():
+    vit = "swin_base_patch4_window7_224_in22k"
+    patch_size = 32
+    image_size = 224
+    train_transform_keys = ["imagenet"]
+    val_transform_keys = ["imagenet"]
+    input_image_embed_size = 1024
+
+
+@ex.named_config
+def swin32_base384():
+    vit = "swin_base_patch4_window12_384_in22k"
+    patch_size = 32
+    image_size = 384
+    train_transform_keys = ["imagenet"]
+    val_transform_keys = ["imagenet"]
+    input_image_embed_size = 1024
+
+
+@ex.named_config
+def swin32_large384():
+    vit = "swin_large_patch4_window12_384_in22k"
+    patch_size = 32
+    image_size = 384
+    train_transform_keys = ["imagenet"]
+    val_transform_keys = ["imagenet"]
+    input_image_embed_size = 1536
+
+
+@ex.named_config
+def clip32():
+    vit = 'ViT-B/32'
+    image_size = 224
+    patch_size = 32
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+
+
+@ex.named_config
+def clip16():
+    vit = 'downloaded/ViT-B-16.pt'
+    # vit = 'ViT-B/16'
+    image_size = 224
+    patch_size = 16
+    train_transform_keys = ["clip"]
+    val_transform_keys = ["clip"]
+    input_image_embed_size = 768
+
+
+# text encoder
+@ex.named_config
+def text_roberta():
+    tokenizer = "roberta-base"
+    vocab_size = 50265
+    input_text_embed_size = 768
+
+
+@ex.named_config
+def text_roberta_large():
+    tokenizer = "roberta-large"
+    vocab_size = 50265
+    input_text_embed_size = 1024
+
+
+# random augmentation
+@ex.named_config
+def imagenet_randaug():
+    train_transform_keys = ["imagenet_randaug"]
+
+
+@ex.named_config
+def clip_randaug():
+    train_transform_keys = ["clip_randaug"]
+
+
+@ex.named_config
+def clip_resizedcrop():
+    train_transform_keys = ["clip_resizedcrop"]
+==> m3ae/modules/__init__.py <==
+from .m3ae_module import M3AETransformerSS
+==> m3ae/modules/dist_utils.py <==
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+"""
+This file contains primitives for multi-gpu communication.
+This is useful when doing distributed training.
+"""
+
+import functools
+import logging
+import pickle
+
+import numpy as np
+import torch
+import torch.distributed as dist
+
+_LOCAL_PROCESS_GROUP = None
+"""
+A torch process group which only includes processes that on the same machine as the current process.
+This variable is set when processes are spawned by `launch()` in "engine/launch.py".
+"""
+
+
+def get_world_size() -> int:
+    if not dist.is_available():
+        return 1
+    if not dist.is_initialized():
+        return 1
+    return dist.get_world_size()
+
+
+def get_rank() -> int:
+    if not dist.is_available():
+        return 0
+    if not dist.is_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def get_local_rank() -> int:
+    """
+    Returns:
+        The rank of the current process within the local (per-machine) process group.
+    """
+    if not dist.is_available():
+        return 0
+    if not dist.is_initialized():
+        return 0
+    assert _LOCAL_PROCESS_GROUP is not None
+    return dist.get_rank(group=_LOCAL_PROCESS_GROUP)
+
+
+def get_local_size() -> int:
+    """
+    Returns:
+        The size of the per-machine process group,
+        i.e. the number of processes per machine.
+    """
+    if not dist.is_available():
+        return 1
+    if not dist.is_initialized():
+        return 1
+    return dist.get_world_size(group=_LOCAL_PROCESS_GROUP)
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def synchronize():
+    """
+    Helper function to synchronize (barrier) among all processes when
+    using distributed training
+    """
+    if not dist.is_available():
+        return
+    if not dist.is_initialized():
+        return
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return
+    dist.barrier()
+
+
+@functools.lru_cache()
+def _get_global_gloo_group():
+    """
+    Return a process group based on gloo backend, containing all the ranks
+    The result is cached.
+    """
+    if dist.get_backend() == "nccl":
+        return dist.new_group(backend="gloo")
+    else:
+        return dist.group.WORLD
+
+
+def _serialize_to_tensor(data, group):
+    backend = dist.get_backend(group)
+    assert backend in ["gloo", "nccl"]
+    device = torch.device("cpu" if backend == "gloo" else "cuda")
+
+    buffer = pickle.dumps(data)
+    if len(buffer) > 1024 ** 3:
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "Rank {} trying to all-gather {:.2f} GB of data on device {}".format(
+                get_rank(), len(buffer) / (1024 ** 3), device
+            )
+        )
+    storage = torch.ByteStorage.from_buffer(buffer)
+    tensor = torch.ByteTensor(storage).to(device=device)
+    return tensor
+
+
+def _pad_to_largest_tensor(tensor, group):
+    """
+    Returns:
+        list[int]: size of the tensor, on each rank
+        Tensor: padded tensor that has the max size
+    """
+    world_size = dist.get_world_size(group=group)
+    assert (
+            world_size >= 1
+    ), "comm.gather/all_gather must be called from ranks within the given group!"
+    local_size = torch.tensor([tensor.numel()], dtype=torch.int64, device=tensor.device)
+    size_list = [
+        torch.zeros([1], dtype=torch.int64, device=tensor.device)
+        for _ in range(world_size)
+    ]
+    dist.all_gather(size_list, local_size, group=group)
+    size_list = [int(size.item()) for size in size_list]
+
+    max_size = max(size_list)
+
+    # we pad the tensor because torch all_gather does not support
+    # gathering tensors of different shapes
+    if local_size != max_size:
+        padding = torch.zeros(
+            (max_size - local_size,), dtype=torch.uint8, device=tensor.device
+        )
+        tensor = torch.cat((tensor, padding), dim=0)
+    return size_list, tensor
+
+
+def all_gather(data, group=None):
+    """
+    Run all_gather on arbitrary picklable data (not necessarily tensors).
+
+    Args:
+        data: any picklable object
+        group: a torch process group. By default, will use a group which
+            contains all ranks on gloo backend.
+
+    Returns:
+        list[data]: list of data gathered from each rank
+    """
+    if get_world_size() == 1:
+        return [data]
+    if group is None:
+        group = _get_global_gloo_group()
+    if dist.get_world_size(group) == 1:
+        return [data]
+
+    tensor = _serialize_to_tensor(data, group)
+
+    size_list, tensor = _pad_to_largest_tensor(tensor, group)
+    max_size = max(size_list)
+
+    # receiving Tensor from all ranks
+    tensor_list = [
+        torch.empty((max_size,), dtype=torch.uint8, device=tensor.device)
+        for _ in size_list
+    ]
+    dist.all_gather(tensor_list, tensor, group=group)
+
+    data_list = []
+    for size, tensor in zip(size_list, tensor_list):
+        buffer = tensor.cpu().numpy().tobytes()[:size]
+        data_list.append(pickle.loads(buffer))
+
+    return data_list
+
+
+def gather(data, dst=0, group=None):
+    """
+    Run gather on arbitrary picklable data (not necessarily tensors).
+
+    Args:
+        data: any picklable object
+        dst (int): destination rank
+        group: a torch process group. By default, will use a group which
+            contains all ranks on gloo backend.
+
+    Returns:
+        list[data]: on dst, a list of data gathered from each rank. Otherwise,
+            an empty list.
+    """
+    if get_world_size() == 1:
+        return [data]
+    if group is None:
+        group = _get_global_gloo_group()
+    if dist.get_world_size(group=group) == 1:
+        return [data]
+    rank = dist.get_rank(group=group)
+
+    tensor = _serialize_to_tensor(data, group)
+    size_list, tensor = _pad_to_largest_tensor(tensor, group)
+
+    # receiving Tensor from all ranks
+    if rank == dst:
+        max_size = max(size_list)
+        tensor_list = [
+            torch.empty((max_size,), dtype=torch.uint8, device=tensor.device)
+            for _ in size_list
+        ]
+        dist.gather(tensor, tensor_list, dst=dst, group=group)
+
+        data_list = []
+        for size, tensor in zip(size_list, tensor_list):
+            buffer = tensor.cpu().numpy().tobytes()[:size]
+            data_list.append(pickle.loads(buffer))
+        return data_list
+    else:
+        dist.gather(tensor, [], dst=dst, group=group)
+        return []
+
+
+def shared_random_seed():
+    """
+    Returns:
+        int: a random number that is the same across all workers.
+            If workers need a shared RNG, they can use this shared seed to
+            create one.
+
+    All workers must call this function, otherwise it will deadlock.
+    """
+    ints = np.random.randint(2 ** 31)
+    all_ints = all_gather(ints)
+    return all_ints[0]
+
+
+def reduce_dict(input_dict, average=True):
+    """
+    Reduce the values in the dictionary from all processes so that process with rank
+    0 has the reduced results.
+
+    Args:
+        input_dict (dict): inputs to be reduced. All the values must be scalar CUDA Tensor.
+        average (bool): whether to do average or sum
+
+    Returns:
+        a dict with the same keys as input_dict, after reduction.
+    """
+    world_size = get_world_size()
+    if world_size < 2:
+        return input_dict
+    with torch.no_grad():
+        names = []
+        values = []
+        # sort the keys so that they are consistent across processes
+        for k in sorted(input_dict.keys()):
+            names.append(k)
+            values.append(input_dict[k])
+        values = torch.stack(values, dim=0)
+        dist.reduce(values, dst=0)
+        if dist.get_rank() == 0 and average:
+            # only main process gets accumulated, so only divide by
+            # world_size in this case
+            values /= world_size
+        reduced_dict = {k: v for k, v in zip(names, values)}
+    return reduced_dict
+
+==> m3ae/modules/m3ae_module.py <==
+import math
+import random
+
+import pytorch_lightning as pl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.utils import clip_grad_norm_
+
+from transformers import RobertaConfig, RobertaModel, RobertaForCausalLM, AutoTokenizer
+from transformers.models.bert.modeling_bert import BertConfig, BertModel
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+
+from m3ae.modules import objectives, m3ae_utils
+from m3ae.modules import prediction_heads
+from m3ae.modules.language_encoders.bert_model import BertCrossLayer, GAT_module
+from m3ae.modules.m3ae_utils import init_weights
+from m3ae.modules.vision_encoders import swin_transformer as swin
+from m3ae.modules.vision_encoders.clip_model import build_model, adapt_position_encoding
+from m3ae.modules.vision_encoders.swin_helpers import swin_adapt_position_encoding
+
+from lavis.models.blip2_models.blip2_qformer import Blip2Qformer
+
+from transformers import RobertaTokenizerFast, DataCollatorForWholeWordMask, BatchEncoding
+from m3ae.modules.mambapy.mamba import Mamba, MambaConfig, AdaptiveKGFusion
+
+
+class M3AETransformerSS(pl.LightningModule):
+    def __init__(self, config):
+        super().__init__()
+        self.save_hyperparameters()
+        self.config = config
+
+        self.is_clip = ('swin' not in config['vit'])
+
+        if 'roberta' in config['tokenizer']:
+            bert_config = RobertaConfig(
+                vocab_size=config["vocab_size"],
+                hidden_size=config["hidden_size"],
+                num_hidden_layers=config["num_layers"],
+                num_attention_heads=config["num_heads"],
+                intermediate_size=config["hidden_size"] * config["mlp_ratio"],
+                max_position_embeddings=config["max_text_len"],
+                hidden_dropout_prob=config["drop_rate"],
+                attention_probs_dropout_prob=config["drop_rate"],
+            )
+        elif 'bert' in config['tokenizer']:
+            bert_config = BertConfig(
+                vocab_size=config["vocab_size"],
+                hidden_size=config["hidden_size"],
+                num_hidden_layers=config["num_layers"],
+                num_attention_heads=config["num_heads"],
+                intermediate_size=config["hidden_size"] * config["mlp_ratio"],
+                max_position_embeddings=config["max_text_len"],
+                hidden_dropout_prob=config["drop_rate"],
+                attention_probs_dropout_prob=config["drop_rate"],
+            )
+        else:
+            raise ValueError
+
+        resolution_after = config['image_size']
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                if self.is_clip:
+                    build_model(config['vit'], resolution_after=resolution_after)
+                else:
+                    getattr(swin, self.hparams.config["vit"])(pretrained=True, config=self.hparams.config)
+
+                if 'roberta' in config['tokenizer']:
+                    RobertaModel.from_pretrained(config['tokenizer'])
+                else:
+                    BertModel.from_pretrained(config['tokenizer'])
+            torch.distributed.barrier()
+
+        if self.is_clip:
+            self.vision_encoder = build_model(config['vit'], resolution_after=resolution_after)
+        else:
+            self.vision_encoder = getattr(swin, self.hparams.config["vit"])(pretrained=True, config=self.hparams.config)
+            self.vision_pooler = nn.AdaptiveAvgPool1d(1)
+
+        if 'roberta' in config['tokenizer']:
+            self.language_encoder = RobertaModel.from_pretrained(config['tokenizer'])
+        else:
+            self.language_encoder = BertModel.from_pretrained(config['tokenizer'])
+
+        self.tokenizer = T5Tokenizer.from_pretrained(config['T5_model'])
+        self.language_decoder = T5ForConditionalGeneration.from_pretrained(config['T5_model'])
+
+        self.multi_modal_language_proj = nn.Linear(config['input_text_embed_size'], config['hidden_size'])
+        self.language_proj = nn.Linear(config['input_text_embed_size'], config['embed_dim'])
+        self.multi_modal_language_proj.apply(init_weights)
+
+        self.multi_modal_vision_proj = nn.Linear(config['input_image_embed_size'], config['hidden_size'])
+        self.vision_proj = nn.Linear(config['input_text_embed_size'], config['embed_dim'])
+        self.multi_modal_vision_proj.apply(init_weights)
+
+        self.modality_type_embeddings = nn.Embedding(2, config["hidden_size"])
+        self.modality_type_embeddings.apply(init_weights)
+
+        used_device = f"cuda:{config['gpu_ids']}" if torch.cuda.is_available() else "cpu"
+        self.latent_prompt_size = config['latent_prompt_size']
+        self.organ_disease_feat_size = 577
+        self.GAT_feat = 32
+        self.adj_feat = torch.load(config["adj_feat_path"], map_location=used_device)
+        self.organ_disease_feat = torch.load(config["organ_disease_feat"], map_location=used_device)
+        
+        self.GAT_layer = GAT_module(config["hidden_size"])
+        self.organ_average = nn.Conv1d(self.organ_disease_feat_size, self.GAT_feat, 1)
+        self.organ_average.apply(init_weights)
+
+        self.qformer = Blip2Qformer()
+
+        mamba_config = MambaConfig(d_model=config["hidden_size"], n_layers=2)
+        self.multi_modal_vision_mamba = Mamba(mamba_config)
+        self.multi_modal_graph_mamba = Mamba(mamba_config)
+        self.multi_modal_kg_fusion = AdaptiveKGFusion(config["hidden_size"])
+
+        self.multi_modal_vision_pooler = prediction_heads.Pooler(config["hidden_size"])
+        self.multi_modal_vision_pooler.apply(init_weights)
+        self.multi_modal_language_pooler = prediction_heads.Pooler(config["hidden_size"])
+        self.multi_modal_language_pooler.apply(init_weights)
+
+        itc = False
+        if itc:
+            self.temp = nn.Parameter(torch.ones(1) * config['temp'])
+            self.queue_size = config['queue_size']
+            self.momentum = config['momentum']
+
+            self.vision_encoder_m = build_model(config['vit'], resolution_after=resolution_after)
+            self.vision_proj_m = nn.Linear(config['input_image_embed_size'], config['embed_dim'])
+
+            self.language_encoder_m = RobertaModel.from_pretrained(config['tokenizer'])
+            self.language_proj_m = nn.Linear(config['input_text_embed_size'], config['embed_dim'])
+
+            self.model_pairs = [
+                [self.vision_encoder, self.vision_encoder_m],
+                [self.vision_proj, self.vision_proj_m],
+                [self.language_encoder, self.language_encoder_m],
+                [self.language_proj, self.language_proj_m],
+            ]
+
+            self.copy_params()
+
+            self.register_buffer("image_queue", torch.randn(config['embed_dim'], self.queue_size))
+            self.register_buffer("text_queue", torch.randn(config['embed_dim'], self.queue_size))
+            self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+            self.image_queue = nn.functional.normalize(self.image_queue, dim=0)
+            self.text_queue = nn.functional.normalize(self.text_queue, dim=0)
+
+        if config["loss_names"]["mlm"] > 0:
+            self.mlm_head = prediction_heads.MLMHead(bert_config)
+            self.mlm_head.apply(init_weights)
+        if config["loss_names"]["mim"] > 0:
+            self.mim_head = prediction_heads.MIMHead(config)
+            self.mim_head.apply(init_weights)
+        if config["loss_names"]["itm"] > 0 or self.hparams.config["loss_names"]["irtr"] > 0:
+            self.itm_head = prediction_heads.ITMHead(config["hidden_size"] * 2)
+            self.itm_head.apply(init_weights)
+
+        if self.hparams.config["load_path"] != "" and not self.hparams.config["test_only"]:
+            ckpt = torch.load(self.hparams.config["load_path"], map_location="cpu")
+            state_dict = ckpt["state_dict"]
+            if self.is_clip:
+                state_dict = adapt_position_encoding(
+                    state_dict,
+                    after=resolution_after,
+                    patch_size=self.hparams.config['patch_size']
+                )
+            else:
+                state_dict = swin_adapt_position_encoding(state_dict, after=resolution_after)
+            self.load_state_dict(state_dict, strict=False)
+
+        hs = self.hparams.config["hidden_size"]
+        if self.hparams.config["loss_names"]["vqa"] > 0:
+            vs = self.hparams.config["vqa_label_size"]
+            self.vqa_head = nn.Sequential(
+                nn.Linear(hs * 2, hs * 2),
+                nn.LayerNorm(hs * 2),
+                nn.GELU(),
+                nn.Linear(hs * 2, vs),
+            )
+            self.vqa_head.apply(init_weights)
+
+        if self.hparams.config["loss_names"]["cls"] > 0:
+            ms = self.hparams.config["melinda_label_size"][self.hparams.config["label_column_name"]]
+            self.cls_head = nn.Sequential(
+                nn.Linear(hs * 2, hs * 2),
+                nn.LayerNorm(hs * 2),
+                nn.GELU(),
+                nn.Linear(hs * 2, ms),
+            )
+            self.cls_head.apply(init_weights)
+
+        if self.hparams.config["loss_names"]["irtr"] > 0:
+            self.irtr_head = nn.Linear(hs * 2, 1)
+            self.irtr_head.weight.data = self.itm_head.fc.weight.data[1:, :]
+            self.irtr_head.bias.data = self.itm_head.fc.bias.data[1:]
+            self.margin = 0.2
+            for p in self.itm_head.parameters():
+                p.requires_grad = False
+
+        m3ae_utils.set_metrics(self)
+        self.current_tasks = list()
+
+        if self.hparams.config["load_path"] != "" and self.hparams.config["test_only"]:
+            ckpt = torch.load(self.hparams.config["load_path"], map_location="cpu")
+            state_dict = ckpt["state_dict"]
+            state_dict = adapt_position_encoding(
+                state_dict,
+                after=resolution_after,
+                patch_size=self.hparams.config['patch_size']
+            )
+            self.load_state_dict(state_dict, strict=False)
+
+    def random_masking(self, x, mask_ratio):
+        x_ = x[:, :1]
+        x = x[:, 1:]
+        pos_embed = self.vision_encoder.visual.positional_embedding.unsqueeze(0).to(x)
+
+        N, L, D = x.shape
+        len_keep = int(L * (1 - mask_ratio))
+
+        noise = torch.rand(N, L, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        ids_keep = ids_shuffle[:, :len_keep]
+        x += pos_embed[:, 1:]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        x_ = x_ + pos_embed[:, :1]
+        x_masked = torch.cat((x_, x_masked), dim=1)
+
+        return x_masked, mask, ids_restore
+
+    def patchify(self, imgs):
+        p = self.hparams.config["patch_size"]
+        assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
+        h = w = imgs.shape[2] // p
+        x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p))
+        x = torch.einsum('nchpwq->nhwpqc', x)
+        x = x.reshape(shape=(imgs.shape[0], h * w, p ** 2 * 3))
+        return x
+
+    def unpatchify(self, x):
+        p = self.hparams.config["patch_size"]
+        h = w = int(x.shape[1] ** .5)
+        assert h * w == x.shape[1]
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, 3))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
+        return imgs
+
+    def infer(
+            self,
+            batch,
+            mask_text=False,
+            mask_image=False,
+            image_token_type_idx=1,
+            img=None,
+            output_attentions=True,
+            itc=False,
+            unimodal=False,
+    ):
+        ret = dict()
+
+        if img is None:
+            if f"image_{image_token_type_idx - 1}" in batch:
+                img_key = f"image_{image_token_type_idx - 1}"
+            else:
+                img_key = "image"
+            img = batch[img_key][0]
+        device = img.device
+        do_mlm = "_mlm" if mask_text else ""
+        text_ids = batch[f"text_ids{do_mlm}"].to(device)
+        text_labels = batch[f"text_labels{do_mlm}"].to(device)
+        text_masks = batch[f"text_masks"].to(device)
+
+        vqa_answers = [item[0] for item in batch["vqa_answer"]]
+        answer = self.tokenizer(vqa_answers, padding=True, return_tensors="pt").to(device)
+        answer_targets = answer.input_ids.masked_fill(answer.input_ids == self.tokenizer.pad_token_id, -100).to(device)
+
+        uni_modal_text_feats = self.language_encoder.embeddings(input_ids=text_ids)
+        text_input_shape = text_masks.size()
+        extended_text_masks = self.language_encoder.get_extended_attention_mask(text_masks, text_input_shape, device)
+        for layer in self.language_encoder.encoder.layer:
+            uni_modal_text_feats = layer(uni_modal_text_feats, extended_text_masks)[0]
+
+        text_feat = F.normalize(self.language_proj(uni_modal_text_feats[:, 0, :]), dim=-1)
+
+        if mask_image:
+            uni_modal_image_feats = self.vision_encoder.forward_patch_embed(img)
+            uni_modal_image_feats, mim_masks, mim_ids_restore = self.random_masking(
+                uni_modal_image_feats, self.hparams.config["mim_prob"]
+            )
+            uni_modal_image_feats = self.vision_encoder.forward_trans(uni_modal_image_feats)
+            ret["mim_masks"] = mim_masks
+            ret["mim_ids_restore"] = mim_ids_restore
+        else:
+            uni_modal_image_feats = self.vision_encoder(img)
+
+        image_feat = F.normalize(self.vision_proj(uni_modal_image_feats[:, 0, :]), dim=-1)
+
+        image_masks = torch.ones(
+            (uni_modal_image_feats.size(0), uni_modal_image_feats.size(1)),
+            dtype=torch.long,
+            device=device
+        )
+        extended_image_masks = self.language_encoder.get_extended_attention_mask(
+            image_masks, image_masks.size(), device
+        )
+
+        if itc:
+            with torch.no_grad():
+                self.temp.clamp_(0.001, 0.5)
+
+            alpha = 0.4
+
+            with torch.no_grad():
+                self._momentum_update()
+
+                image_embeds_m = self.vision_encoder_m(img)
+                image_feat_m = F.normalize(self.vision_proj_m(image_embeds_m[:, 0, :]), dim=-1)
+                image_feat_all = torch.cat([image_feat_m.t(), self.image_queue.clone().detach()], dim=1)
+
+                text_output_m = self.language_encoder_m.embeddings(input_ids=text_ids)
+                text_input_shape = text_masks.size()
+                extended_text_masks = self.language_encoder.get_extended_attention_mask(
+                    text_masks, text_input_shape, device
+                )
+                for layer in self.language_encoder.encoder.layer:
+                    text_output_m = layer(text_output_m, extended_text_masks)[0]
+                text_output_m = self.multi_modal_language_proj(text_output_m)
+                text_feat_m = F.normalize(self.language_proj_m(text_output_m[:, 0, :]), dim=-1)
+                text_feat_all = torch.cat([text_feat_m.t(), self.text_queue.clone().detach()], dim=1)
+
+                sim_i2t_m = image_feat_m @ text_feat_all / self.temp
+                sim_t2i_m = text_feat_m @ image_feat_all / self.temp
+
+                sim_targets = torch.zeros(sim_i2t_m.size()).to(img.device)
+                sim_targets.fill_diagonal_(1)
+
+                sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets
+                sim_t2i_targets = alpha * F.softmax(sim_t2i_m, dim=1) + (1 - alpha) * sim_targets
+
+            sim_i2t = image_feat @ text_feat_all / self.temp
+            sim_t2i = text_feat @ image_feat_all / self.temp
+
+            loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1) * sim_i2t_targets, dim=1).mean()
+            loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1) * sim_t2i_targets, dim=1).mean()
+
+            loss_itc = (loss_i2t + loss_t2i) / 2
+
+            self._dequeue_and_enqueue(image_feat_m, text_feat_m)
+        else:
+            loss_itc = 0.0
+
+        uni_modal_text_feats, uni_modal_image_feats = (
+            uni_modal_text_feats + self.modality_type_embeddings(torch.zeros_like(text_masks)),
+            uni_modal_image_feats + self.modality_type_embeddings(torch.full_like(image_masks, image_token_type_idx)),
+        )
+
+        ret["attentions"] = {"text2image_attns": [], "image2text_attns": []} if output_attentions else None
+        x, y = uni_modal_text_feats, uni_modal_image_feats
+
+        adj_feat = self.adj_feat.to(device)
+        organ_disease_feat = self.organ_disease_feat.to(device).long()
+        
+        vocab_size = self.language_encoder.embeddings.word_embeddings.num_embeddings
+        organ_disease_feat = torch.clamp(organ_disease_feat, 0, vocab_size - 1)
+        
+        if organ_disease_feat.dim() > 1:
+            organ_disease_feat = organ_disease_feat.view(-1)
+        if organ_disease_feat.size(0) != 577:
+            organ_disease_feat = organ_disease_feat[:577]
+            
+        organ_disease_feat = self.language_encoder.embeddings.word_embeddings(organ_disease_feat)
+        if organ_disease_feat.dim() == 2:
+            organ_disease_feat = organ_disease_feat.unsqueeze(0).expand(x.size(0), -1, -1)
+
+        GAT_feat = self.GAT_layer(x, organ_disease_feat, adj_feat)
+        GAT_feat = self.organ_average(GAT_feat)
+
+        y, loss_itc = self.qformer(x, y)
+
+        x1, y = self.multi_modal_vision_mamba(x, y, mask_v=text_masks)
+        x2, k = self.multi_modal_graph_mamba(x, GAT_feat, mask_v=text_masks)
+
+        multi_modal_text_feat_i, multi_modal_text_feat_k, multi_modal_image_feats, knowledge_feat = x1, x2, y, k
+
+        multi_modal_text_feats, multi_modal_image_feats = self.multi_modal_kg_fusion(
+            multi_modal_text_feat_i,
+            multi_modal_text_feat_k,
+            knowledge_feat,
+            z_t2z=multi_modal_image_feats,
+        )
+        multi_modal_text_cls_feats = self.multi_modal_language_pooler(multi_modal_text_feats)
+
+        if self.is_clip:
+            multi_modal_image_cls_feats = self.multi_modal_vision_pooler(multi_modal_image_feats)
+        else:
+            avg_image_feats = self.vision_pooler(multi_modal_image_feats.transpose(1, 2)).view(
+                multi_modal_image_feats.size(0), 1, -1
+            )
+            multi_modal_image_cls_feats = self.multi_modal_vision_pooler(avg_image_feats)
+
+        multi_modal_cls_feats = torch.cat([multi_modal_text_cls_feats, multi_modal_image_cls_feats], dim=-1)
+
+        multi_modal_feats = torch.cat([multi_modal_text_feats, multi_modal_image_feats], dim=1)
+
+        indexs_open = []
+        for i in range(len(batch["answer_types"])):
+            if batch["answer_types"][i] == 1:
+                indexs_open.append(i)
+
+        multi_modal_open_feats = multi_modal_feats[indexs_open, :]
+        open_answer_targets = answer_targets[indexs_open, :]
+
+        attention_masks = torch.ones((multi_modal_open_feats.size(0), multi_modal_open_feats.size(1)), device=device)
+
+        if len(indexs_open) == 0:
+            ag_loss = 0.0
+        else:
+            if torch.isnan(multi_modal_open_feats).any() or torch.isinf(multi_modal_open_feats).any():
+                ag_loss = 0.0
+            elif torch.isnan(open_answer_targets).any() or torch.isinf(open_answer_targets).any():
+                ag_loss = 0.0
+            elif attention_masks.shape != (multi_modal_open_feats.size(0), multi_modal_open_feats.size(1)):
+                ag_loss = 0.0
+            elif not ((attention_masks == 0) | (attention_masks == 1)).all():
+                ag_loss = 0.0
+            else:
+                multi_modal_open_feats = multi_modal_open_feats.float()
+                open_answer_targets = open_answer_targets.long()
+
+                answer_output = self.language_decoder(
+                    inputs_embeds=multi_modal_open_feats,
+                    attention_mask=attention_masks,
+                    labels=open_answer_targets,
+                    return_dict=True,
+                )
+                ag_loss = answer_output.loss
+                clip_grad_norm_(self.language_decoder.parameters(), max_norm=1.0)
+
+        ret.update({
+            "images": img,
+            "patched_images": self.patchify(img),
+            "text_labels": text_labels,
+            "text_ids": text_ids,
+            "text_masks": text_masks,
+            "extended_image_masks": extended_image_masks,
+            "extended_text_masks": extended_text_masks,
+            "multi_modal_text_feats": multi_modal_text_feats,
+            "multi_modal_image_feats": multi_modal_image_feats,
+            "multi_modal_cls_feats": multi_modal_cls_feats,
+            "itc_loss": loss_itc,
+            "ag_loss": ag_loss
+        })
+
+        return ret
+
+    def forward(self, batch, test=False):
+        ret = dict()
+
+        if len(self.current_tasks) == 0:
+            ret.update(self.infer(batch))
+            return ret
+
+        if "mlm" in self.current_tasks:
+            ret.update(objectives.compute_mlm(self, batch))
+
+        if "mim" in self.current_tasks:
+            ret.update(objectives.compute_mim(self, batch))
+
+        if "itm" in self.current_tasks:
+            ret.update(objectives.compute_itm(self, batch))
+
+        if "vqa" in self.current_tasks:
+            ret.update(objectives.compute_vqa(self, batch, test=test))
+
+        if "cls" in self.current_tasks:
+            ret.update(objectives.compute_cls(self, batch, test=test))
+
+        if "irtr" in self.current_tasks:
+            ret.update(objectives.compute_irtr(self, batch, test))
+
+        return ret
+
+    def training_step(self, batch, batch_idx):
+        m3ae_utils.set_task(self)
+        output = self(batch)
+        total_loss = sum([
+            v * self.hparams.config["loss_names"][k.replace("_loss", "")]
+            for k, v in output.items() if "loss" in k
+        ])
+        return total_loss
+
+    def training_epoch_end(self, outs):
+        m3ae_utils.epoch_wrapup(self)
+
+    def validation_step(self, batch, batch_idx):
+        m3ae_utils.set_task(self)
+        output = self(batch)
+
+    def validation_epoch_end(self, outs):
+        m3ae_utils.epoch_wrapup(self)
+
+    def test_step(self, batch, batch_idx):
+        m3ae_utils.set_task(self)
+        output = self(batch, test=True)
+
+    def test_epoch_end(self, outs):
+        m3ae_utils.epoch_wrapup(self, test=True)
+
+    def configure_optimizers(self):
+        return m3ae_utils.set_schedule(self)
+
+    @torch.no_grad()
+    def copy_params(self):
+        for model_pair in self.model_pairs:
+            for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
+                param_m.data.copy_(param.data)
+                param_m.requires_grad = False
+
+    @torch.no_grad()
+    def _momentum_update(self):
+        for model_pair in self.model_pairs:
+            for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
+                param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, image_feat, text_feat):
+        if is_dist_avail_and_initialized():
+            image_feats = concat_all_gather(image_feat)
+            text_feats = concat_all_gather(text_feat)
+        else:
+            image_feats = image_feat
+            text_feats = text_feat
+
+        batch_size = image_feats.shape[0]
+        ptr = int(self.queue_ptr)
+        assert self.queue_size % batch_size == 0
+
+        self.image_queue[:, ptr:ptr + batch_size] = image_feats.T
+        self.text_queue[:, ptr:ptr + batch_size] = text_feats.T
+        ptr = (ptr + batch_size) % self.queue_size
+        self.queue_ptr[0] = ptr
+
+
+@torch.no_grad()
+def concat_all_gather(tensor):
+    tensors_gather = [torch.ones_like(tensor) for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
+    output = torch.cat(tensors_gather, dim=0)
+    return output
+
+
+def is_dist_avail_and_initialized():
+    if not dist.is_available():
+        return False
+    if not dist.is_initialized():
+        return False
+    return True
+
+
+class GatedMultimodalLayer(nn.Module):
+    def __init__(self, size_in1, size_in2, size_out):
+        super().__init__()
+        self.size_in1, self.size_in2, self.size_out = size_in1, size_in2, size_out
+
+        weights_hidden1 = torch.Tensor(size_out, size_in1)
+        self.weights_hidden1 = nn.Parameter(weights_hidden1)
+
+        weights_hidden2 = torch.Tensor(size_out, size_in2)
+        self.weights_hidden2 = nn.Parameter(weights_hidden2)
+
+        weight_sigmoid = torch.Tensor(size_out * 2)
+        self.weight_sigmoid = nn.Parameter(weight_sigmoid)
+
+        nn.init.kaiming_uniform_(self.weights_hidden1, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.weights_hidden2, a=math.sqrt(5))
+        nn.init.normal_(self.weight_sigmoid)
+
+        self.tanh_f = nn.Tanh()
+        self.sigmoid_f = nn.Sigmoid()
+
+    def forward(self, x1, x2):
+        h1 = self.tanh_f(torch.mm(x1, self.weights_hidden1.t()))
+        h2 = self.tanh_f(torch.mm(x2, self.weights_hidden2.t()))
+        x = torch.cat((h1, h2), dim=1)
+        z = self.sigmoid_f(torch.matmul(x, self.weight_sigmoid.t()))
+
+        return z.view(z.size()[0], 1) * h1 + (1 - z).view(z.size()[0], 1) * h2
+==> m3ae/modules/m3ae_utils.py <==
+import torch
+import torch.nn as nn
+from transformers import get_polynomial_decay_schedule_with_warmup, get_cosine_schedule_with_warmup
+from torch.optim import AdamW
+
+from .objectives import compute_irtr_recall
+from ..gadgets.my_metrics import Accuracy, Scalar, VQARADScore
+
+
+def set_metrics(pl_module):
+    for split in ["train", "val"]:
+        for k, v in pl_module.hparams.config["loss_names"].items():
+            if v <= 0:
+                continue
+            if k == "vqa":
+                if split == "train":
+                    setattr(pl_module, f"train_{k}_score", VQARADScore())
+                    setattr(pl_module, f"train_{k}_loss", Scalar())
+                else:
+                    setattr(pl_module, f"val_{k}_score", VQARADScore())
+                    setattr(pl_module, f"val_{k}_loss", Scalar())
+                    setattr(pl_module, f"test_{k}_score", VQARADScore())
+                    setattr(pl_module, f"test_{k}_loss", Scalar())
+
+            elif k == "cls":
+                if split == "train":
+                    setattr(pl_module, f"train_{k}_accuracy", Accuracy())
+                    setattr(pl_module, f"train_{k}_loss", Scalar())
+                else:
+                    setattr(pl_module, f"val_{k}_accuracy", Accuracy())
+                    setattr(pl_module, f"val_{k}_loss", Scalar())
+                    setattr(pl_module, f"test_{k}_accuracy", Accuracy())
+                    setattr(pl_module, f"test_{k}_loss", Scalar())
+
+            elif k == "irtr":
+                if split == "train":
+                    setattr(pl_module, "train_irtr_loss", Scalar())
+                else:
+                    setattr(pl_module, "val_irtr_loss", Scalar())
+                    setattr(pl_module, "test_irtr_loss", Scalar())
+
+            elif k == "itm":
+                setattr(pl_module, f"{split}_{k}_accuracy", Accuracy())
+                setattr(pl_module, f"{split}_{k}_loss", Scalar())
+
+            elif k == "mlm":
+                setattr(pl_module, f"{split}_{k}_accuracy", Accuracy())
+                setattr(pl_module, f"{split}_{k}_loss", Scalar())
+
+            elif k == "mim":
+                setattr(pl_module, f"{split}_{k}_accuracy", Accuracy())
+                setattr(pl_module, f"{split}_{k}_loss", Scalar())
+
+            else:
+                raise ValueError
+
+
+def epoch_wrapup(pl_module, test=False):
+    if test:
+        phase = "test"
+    else:
+        phase = "train" if pl_module.training else "val"
+
+    the_metric = 0
+    if (pl_module.hparams.config["get_recall_metric"] and not pl_module.training) \
+            or (test and pl_module.hparams.config["loss_names"]["irtr"] >= 1):
+        (ir_r1, ir_r5, ir_r10, tr_r1, tr_r5, tr_r10) = compute_irtr_recall(pl_module)
+        print((ir_r1, ir_r5, ir_r10, tr_r1, tr_r5, tr_r10), pl_module.global_step)
+        pl_module.log(f"{phase}/recalls/ir_r1", ir_r1)
+        pl_module.log(f"{phase}/recalls/ir_r5", ir_r5)
+        pl_module.log(f"{phase}/recalls/ir_r10", ir_r10)
+        pl_module.log(f"{phase}/recalls/tr_r1", tr_r1)
+        pl_module.log(f"{phase}/recalls/tr_r5", tr_r5)
+        pl_module.log(f"{phase}/recalls/tr_r10", tr_r10)
+        pl_module.logger.experiment[0].add_scalar("recalls/ir_r1", ir_r1, pl_module.global_step)
+        pl_module.logger.experiment[0].add_scalar("recalls/ir_r5", ir_r5, pl_module.global_step)
+        pl_module.logger.experiment[0].add_scalar("recalls/ir_r10", ir_r10, pl_module.global_step)
+        pl_module.logger.experiment[0].add_scalar("recalls/tr_r1", tr_r1, pl_module.global_step)
+        pl_module.logger.experiment[0].add_scalar("recalls/tr_r5", tr_r5, pl_module.global_step)
+        pl_module.logger.experiment[0].add_scalar("recalls/tr_r10", tr_r10, pl_module.global_step)
+        the_metric += ir_r1.item() + tr_r1.item()
+
+    for loss_name, v in pl_module.hparams.config["loss_names"].items():
+        if v <= 0:
+            continue
+        value = 0
+        if loss_name == "vqa":
+            value = getattr(pl_module, f"{phase}_{loss_name}_score").compute()
+            pl_module.log(f"{loss_name}/{phase}/score_epoch", value)
+            pl_module.log(f"{loss_name}/{phase}/score_best_epoch",
+                          getattr(pl_module, f"{phase}_{loss_name}_score").get_best_score())
+            pl_module.log(f"{loss_name}/{phase}/close_score_best_epoch",
+                          getattr(pl_module, f"{phase}_{loss_name}_score").get_best_close_score())
+            pl_module.log(f"{loss_name}/{phase}/open_score_best_epoch",
+                          getattr(pl_module, f"{phase}_{loss_name}_score").get_best_open_score())
+            getattr(pl_module, f"{phase}_{loss_name}_score").reset()
+
+            pl_module.log(f"{loss_name}/{phase}/loss_epoch", getattr(pl_module, f"{phase}_{loss_name}_loss").compute())
+            getattr(pl_module, f"{phase}_{loss_name}_loss").reset()
+
+        elif loss_name == "cls":
+            value = getattr(pl_module, f"{phase}_{loss_name}_accuracy").compute()
+            pl_module.log(f"{loss_name}/{phase}/accuracy_epoch", value)
+            getattr(pl_module, f"{phase}_{loss_name}_accuracy").reset()
+            pl_module.log(f"{loss_name}/{phase}/loss_epoch", getattr(pl_module, f"{phase}_{loss_name}_loss").compute())
+            getattr(pl_module, f"{phase}_{loss_name}_loss").reset()
+
+        elif loss_name == "irtr":
+            value = getattr(pl_module, f"{phase}_irtr_loss").compute()
+            pl_module.log(f"{loss_name}/{phase}/irtr_loss_epoch", value)
+            getattr(pl_module, f"{phase}_irtr_loss").reset()
+            value = -value
+
+        elif loss_name == "itm":
+            value = getattr(pl_module, f"{phase}_{loss_name}_accuracy").compute()
+            pl_module.log(f"{loss_name}/{phase}/accuracy_epoch", value)
+            getattr(pl_module, f"{phase}_{loss_name}_accuracy").reset()
+            pl_module.log(f"{loss_name}/{phase}/loss_epoch", getattr(pl_module, f"{phase}_{loss_name}_loss").compute())
+            getattr(pl_module, f"{phase}_{loss_name}_loss").reset()
+
+        elif loss_name == "mim":
+            value = -getattr(pl_module, f"{phase}_{loss_name}_loss").compute()
+            pl_module.log(f"{loss_name}/{phase}/accuracy_epoch", value)
+            pl_module.log(f"{loss_name}/{phase}/loss_epoch", -value)
+            getattr(pl_module, f"{phase}_{loss_name}_loss").reset()
+
+        elif loss_name == "mlm":
+            value = getattr(pl_module, f"{phase}_{loss_name}_accuracy").compute()
+            pl_module.log(f"{loss_name}/{phase}/accuracy_epoch", value)
+            getattr(pl_module, f"{phase}_{loss_name}_accuracy").reset()
+            pl_module.log(
+                f"{loss_name}/{phase}/loss_epoch",
+                getattr(pl_module, f"{phase}_{loss_name}_loss").compute(),
+            )
+            getattr(pl_module, f"{phase}_{loss_name}_loss").reset()
+        else:
+            raise ValueError
+
+        the_metric += value
+
+    pl_module.log(f"{phase}/the_metric", the_metric)
+
+
+def check_non_acc_grad(pl_module):
+    if pl_module.token_type_embeddings.weight.grad is None:
+        return True
+    else:
+        grad = pl_module.token_type_embeddings.weight.grad
+        return (grad.sum() == 0).item()
+
+
+def set_task(pl_module):
+    pl_module.current_tasks = [k for k, v in pl_module.hparams.config["loss_names"].items() if v > 0]
+    return
+
+
+def init_weights(module):
+    if isinstance(module, (nn.Linear, nn.Embedding)):
+        module.weight.data.normal_(mean=0.0, std=0.02)
+    elif isinstance(module, nn.LayerNorm):
+        module.bias.data.zero_()
+        module.weight.data.fill_(1.0)
+
+    if isinstance(module, nn.Linear) and module.bias is not None:
+        module.bias.data.zero_()
+
+
+def set_schedule(pl_module):
+    lr = pl_module.hparams.config["learning_rate"]
+    wd = pl_module.hparams.config["weight_decay"]
+    lr_multiplier_head = pl_module.hparams.config["lr_multiplier_head"]
+    lr_multiplier_multi_modal = pl_module.hparams.config["lr_multiplier_multi_modal"]
+    end_lr = pl_module.hparams.config["end_lr"]
+    decay_power = pl_module.hparams.config["decay_power"]
+    optim_type = pl_module.hparams.config["optim_type"]
+
+    no_decay = [
+        "bias",
+        "LayerNorm.bias",
+        "LayerNorm.weight",
+        "norm.bias",
+        "norm.weight",
+        "norm1.bias",
+        "norm1.weight",
+        "norm2.bias",
+        "norm2.weight",
+        "layernorm_v",
+        "layernorm_q",
+        "A_log",
+        "D",
+        "D_q",
+        "bi_gate",
+        "attn_gate",
+        "vis_summary_gate",
+    ]
+    head_names = ["mlm_head", "mim_head", "itm_head", "vqa_head", "cls_head", "irtr_head"]
+    multi_modal_names = ["multi_modal", "GAT_layer", "organ_average", "qformer"]
+
+    def is_no_decay(n, p):
+        return any(nd in n for nd in no_decay) or getattr(p, "_no_weight_decay", False)
+
+    optimizer_grouped_parameters = [
+        {
+            "params": [
+                p
+                for n, p in pl_module.named_parameters()
+                if not is_no_decay(n, p)
+                and not any(bb in n for bb in head_names)
+                and not any(ht in n for ht in multi_modal_names)
+            ],
+            "weight_decay": wd,
+            "lr": lr,
+        },
+        {
+            "params": [
+                p
+                for n, p in pl_module.named_parameters()
+                if is_no_decay(n, p)
+                and not any(bb in n for bb in head_names)
+                and not any(ht in n for ht in multi_modal_names)
+            ],
+            "weight_decay": 0.0,
+            "lr": lr,
+        },
+        {
+            "params": [
+                p
+                for n, p in pl_module.named_parameters()
+                if not is_no_decay(n, p)
+                and any(bb in n for bb in head_names)
+                and not any(ht in n for ht in multi_modal_names)
+            ],
+            "weight_decay": wd,
+            "lr": lr * lr_multiplier_head,
+        },
+        {
+            "params": [
+                p
+                for n, p in pl_module.named_parameters()
+                if is_no_decay(n, p)
+                and any(bb in n for bb in head_names)
+                and not any(ht in n for ht in multi_modal_names)
+            ],
+            "weight_decay": 0.0,
+            "lr": lr * lr_multiplier_head,
+        },
+        {
+            "params": [
+                p
+                for n, p in pl_module.named_parameters()
+                if not is_no_decay(n, p)
+                and not any(bb in n for bb in head_names)
+                and any(ht in n for ht in multi_modal_names)
+            ],
+            "weight_decay": wd,
+            "lr": lr * lr_multiplier_multi_modal,
+        },
+        {
+            "params": [
+                p
+                for n, p in pl_module.named_parameters()
+                if is_no_decay(n, p)
+                and not any(bb in n for bb in head_names)
+                and any(ht in n for ht in multi_modal_names)
+            ],
+            "weight_decay": 0.0,
+            "lr": lr * lr_multiplier_multi_modal,
+        },
+    ]
+
+    if optim_type == "adamw":
+        optimizer = AdamW(optimizer_grouped_parameters, lr=lr, eps=1e-8, betas=(0.9, 0.98))
+    elif optim_type == "adam":
+        optimizer = torch.optim.Adam(optimizer_grouped_parameters, lr=lr)
+    elif optim_type == "sgd":
+        optimizer = torch.optim.SGD(optimizer_grouped_parameters, lr=lr, momentum=0.9)
+    else:
+        raise ValueError
+
+    if pl_module.trainer.max_steps is None:
+        max_steps = (
+            len(pl_module.trainer.datamodule.train_dataloader())
+            * pl_module.trainer.max_epochs
+            // pl_module.trainer.accumulate_grad_batches
+        )
+    else:
+        max_steps = pl_module.trainer.max_steps
+
+    warmup_steps = pl_module.hparams.config["warmup_steps"]
+    if isinstance(pl_module.hparams.config["warmup_steps"], float):
+        warmup_steps = int(max_steps * warmup_steps)
+
+    if decay_power == "cosine":
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=max_steps,
+        )
+    else:
+        scheduler = get_polynomial_decay_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=max_steps,
+            lr_end=end_lr,
+            power=decay_power,
+        )
+
+    sched = {"scheduler": scheduler, "interval": "step"}
+
+    return [optimizer], [sched]
+==> m3ae/modules/objectives.py <==
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import functools
+
+import torch
+import torch.nn.functional as F
+import tqdm
+from einops import rearrange
+from torch.utils.data.distributed import DistributedSampler
+
+from .dist_utils import all_gather
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch.nn.functional as F
+
+
+def compute_mlm(pl_module, batch):
+    infer = pl_module.infer(batch, mask_text=True, mask_image=False)
+    mlm_logits = pl_module.mlm_head(infer["multi_modal_text_feats"])
+    mlm_labels = infer["text_labels"]
+
+    mlm_loss = F.cross_entropy(
+        mlm_logits.view(-1, pl_module.hparams.config["vocab_size"]),
+        mlm_labels.view(-1),
+        ignore_index=-100,
+    )
+
+    ret = {
+        "mlm_loss": mlm_loss,
+        "mlm_logits": mlm_logits,
+        "mlm_labels": mlm_labels,
+        "mlm_ids": infer["text_ids"],
+    }
+
+    phase = "train" if pl_module.training else "val"
+    loss = getattr(pl_module, f"{phase}_mlm_loss")(ret["mlm_loss"])
+    acc = getattr(pl_module, f"{phase}_mlm_accuracy")(ret["mlm_logits"], ret["mlm_labels"])
+    pl_module.log(f"mlm/{phase}/loss", loss)
+    pl_module.log(f"mlm/{phase}/accuracy", acc)
+
+    return ret
+
+
+def compute_mim(pl_module, batch):
+    infer = pl_module.infer(batch, mask_text=False, mask_image=True)
+
+    if pl_module.hparams.config["mim_layer"] == -1:
+        multi_modal_image_feats = infer["multi_modal_image_feats"]
+    else:
+        layer_idx = pl_module.hparams.config["mim_layer"]
+        multi_modal_image_feats = infer[f"multi_modal_image_feats_{layer_idx}"]
+
+    mim_logits = pl_module.mim_head(multi_modal_image_feats, infer["mim_ids_restore"])
+
+    target = infer["patched_images"]
+    if pl_module.hparams.config["norm_pix_loss"]:
+        mean = target.mean(dim=-1, keepdim=True)
+        var = target.var(dim=-1, keepdim=True)
+        target = (target - mean) / (var + 1.e-6) ** .5
+    mim_labels = target
+    mask = infer["mim_masks"]
+
+    mim_loss = (mim_logits - mim_labels) ** 2
+    mim_loss = mim_loss.mean(dim=-1)  # [N, L], mean loss per patch
+    mim_loss = (mim_loss * mask).sum() / mask.sum()  # mean loss on removed patches
+
+    ret = {
+        "mim_loss": mim_loss,
+        "mim_logits": mim_logits,
+        "mim_labels": mim_labels,
+    }
+
+    phase = "train" if pl_module.training else "val"
+    loss = getattr(pl_module, f"{phase}_mim_loss")(ret["mim_loss"])
+    acc = -loss
+    pl_module.log(f"mim/{phase}/loss", loss)
+    pl_module.log(f"mim/{phase}/accuracy", acc)
+
+    return ret
+
+
+def compute_itm(pl_module, batch):
+    pos_len = len(batch["text"]) // 2
+    neg_len = len(batch["text"]) - pos_len
+    itm_labels = torch.cat([torch.ones(pos_len), torch.zeros(neg_len)]).to(pl_module.device)
+    itm_labels = itm_labels[torch.randperm(itm_labels.size(0))]
+
+    itm_images = [
+        torch.stack(
+            [
+                ti if itm_labels[i] == 1 else fi
+                for i, (ti, fi) in enumerate(zip(bti, bfi))
+            ]
+        )
+        for bti, bfi in zip(batch["image"], batch["false_image_0"])
+    ]
+
+    batch = {k: v for k, v in batch.items()}
+    batch["image"] = itm_images
+
+    infer = pl_module.infer(batch, mask_text=False, mask_image=False)
+
+    itm_logits = pl_module.itm_head(infer["multi_modal_cls_feats"])
+    itm_loss = F.cross_entropy(itm_logits, itm_labels.long())
+
+    ret = {
+        "itm_loss": itm_loss,
+        "itm_logits": itm_logits,
+        "itm_labels": itm_labels,
+    }
+
+    phase = "train" if pl_module.training else "val"
+    loss = getattr(pl_module, f"{phase}_itm_loss")(ret["itm_loss"])
+    acc = getattr(pl_module, f"{phase}_itm_accuracy")(ret["itm_logits"], ret["itm_labels"])
+    pl_module.log(f"itm/{phase}/loss", loss)
+    pl_module.log(f"itm/{phase}/accuracy", acc)
+
+    return ret
+
+
+def compute_vqa(pl_module, batch, test=False):
+    infer = pl_module.infer(batch, mask_text=False, mask_image=False)  # 使用infer方法通过batch数据进行推理，得到多模态特征推理结果
+    vqa_logits = pl_module.vqa_head(infer["multi_modal_cls_feats"])  # 将推理结果中的多模态分类特征传递到vqahead，计算出vqa的logits（未归一化的预测得分）
+    vqa_targets = torch.zeros(len(vqa_logits), pl_module.hparams.config["vqa_label_size"]).to(
+        pl_module.device)  # 初始化vqa_targets，用于存储目标标签(B，lable_size)
+
+    # 从batch中提取vqa_labels和vqa_scores，答案类型转换为张量
+    vqa_labels = batch["vqa_labels"]
+    vqa_scores = batch["vqa_scores"]
+    vqa_answer_types = torch.tensor(batch["answer_types"]).to(pl_module.device)
+
+    # if test:
+    #     visualize_attention(batch["image"][0],infer["attentions"]["text2image_attns"],infer["attentions"]["image2text_attns"])
+    # 遍历每一个样本的标签和对应分数，构建vqa_targets
+    for i, (_label, _score) in enumerate(zip(vqa_labels, vqa_scores)):
+        for l, s in zip(_label, _score):
+            vqa_targets[i, l] = s
+
+    # 使用二元交叉熵损失函数计算vqa_loss，并×标签数量调整损失
+    vqahead_loss = (F.binary_cross_entropy_with_logits(vqa_logits, vqa_targets) * vqa_targets.shape[1])
+    alpha = 0.2
+    beta = 0.3
+    vqa_loss = vqahead_loss + alpha * infer["itc_loss"] + beta * infer["ag_loss"]
+
+    # 返回结果字典
+    ret = {
+        "vqa_loss": vqa_loss,
+        "itc_loss": infer["itc_loss"],
+        "vqahead_loss": vqahead_loss,
+        "vqa_logits": vqa_logits,
+        "vqa_targets": vqa_targets,
+        "vqa_labels": vqa_labels,
+        "vqa_scores": vqa_scores,
+        "vqa_answer_types": vqa_answer_types,
+    }
+
+    if test:
+        phase = "test"
+    else:
+        phase = "train" if pl_module.training else "val"
+
+    loss = getattr(pl_module, f"{phase}_vqa_loss")(ret["vqa_loss"])
+    score = getattr(pl_module, f"{phase}_vqa_score")(ret["vqa_logits"], ret["vqa_targets"], ret["vqa_answer_types"])
+    pl_module.log(f"vqa/{phase}/loss", loss)
+    # pl_module.log(f"vqa/{phase}/vqa_loss", ret["vqahead_loss"])
+    # pl_module.log(f"vqa/{phase}/itc_loss", ret["itc_loss"])
+    pl_module.log(f"vqa/{phase}/score", score)
+
+    return ret
+
+
+def compute_cls(pl_module, batch, test=False):
+    infer = pl_module.infer(batch, mask_text=False, mask_image=False)
+
+    cls_logits = pl_module.cls_head(infer["multi_modal_cls_feats"])
+    cls_labels = batch["cls_labels"]
+    cls_loss = F.cross_entropy(cls_logits, cls_labels)
+
+    ret = {
+        "cls_loss": cls_loss,
+        "cls_logits": cls_logits,
+        "cls_labels": cls_labels,
+    }
+
+    if test:
+        phase = "test"
+    else:
+        phase = "train" if pl_module.training else "val"
+
+    loss = getattr(pl_module, f"{phase}_cls_loss")(ret["cls_loss"])
+    acc = getattr(pl_module, f"{phase}_cls_accuracy")(ret["cls_logits"], ret["cls_labels"])
+    pl_module.log(f"cls/{phase}/loss", loss)
+    pl_module.log(f"cls/{phase}/accuracy", acc)
+
+    return ret
+
+
+def compute_irtr(pl_module, batch, test=False):
+    is_training_phase = pl_module.training
+    _bs, _c, _h, _w = batch["image"][0].shape
+    false_len = pl_module.hparams.config["draw_false_text"]
+    text_ids = torch.stack([batch[f"false_text_{i}_ids"] for i in range(false_len)], dim=1)
+    text_masks = torch.stack([batch[f"false_text_{i}_masks"] for i in range(false_len)], dim=1)
+    text_labels = torch.stack([batch[f"false_text_{i}_labels"] for i in range(false_len)], dim=1)
+
+    text_ids = torch.cat([batch["text_ids"].unsqueeze(1), text_ids], dim=1)
+    text_masks = torch.cat([batch["text_masks"].unsqueeze(1), text_masks], dim=1)
+    text_labels = torch.cat([batch["text_labels"].unsqueeze(1), text_labels], dim=1)
+    images = batch["image"][0].unsqueeze(1).expand(_bs, false_len + 1, _c, _h, _w)
+
+    batch_infer = {
+        "image": [rearrange(images, "bs fs c h w -> (bs fs) c h w")],
+        "text_ids": rearrange(text_ids, "bs fs tl -> (bs fs) tl"),
+        "text_masks": rearrange(text_masks, "bs fs tl -> (bs fs) tl"),
+        "text_labels": rearrange(text_labels, "bs fs tl -> (bs fs) tl"),
+    }
+
+    infer = pl_module.infer(batch_infer)
+
+    score = pl_module.irtr_head(infer["multi_modal_cls_feats"])[:, 0]
+    score = rearrange(score, "(bs fs) -> bs fs", bs=_bs, fs=false_len + 1)
+    answer = torch.zeros(_bs).to(score).long()
+    irtr_loss = F.cross_entropy(score, answer)
+
+    ret = {"irtr_loss": irtr_loss}
+
+    if test:
+        phase = "test"
+    else:
+        phase = "train" if pl_module.training else "val"
+
+    irtr_loss = getattr(pl_module, f"{phase}_irtr_loss")(ret["irtr_loss"])
+    pl_module.log(f"irtr/{phase}/irtr_loss", irtr_loss)
+
+    return ret
+
+
+@torch.no_grad()
+def compute_irtr_recall(pl_module):
+    text_dset = pl_module.trainer.datamodule.dms[0].make_no_false_val_dset()
+    text_dset.tokenizer = pl_module.trainer.datamodule.dms[0].tokenizer
+    text_loader = torch.utils.data.DataLoader(
+        text_dset,
+        batch_size=256,
+        num_workers=pl_module.hparams.config["num_workers"],
+        pin_memory=True,
+        collate_fn=functools.partial(text_dset.collate,
+                                     mlm_collator=pl_module.trainer.datamodule.dms[0].mlm_collator, ), )
+
+    image_dset = pl_module.trainer.datamodule.dms[0].make_no_false_val_dset(image_only=True)
+    image_dset.tokenizer = pl_module.trainer.datamodule.dms[0].tokenizer
+    dist_sampler = DistributedSampler(image_dset, shuffle=False)
+    image_loader = torch.utils.data.DataLoader(
+        image_dset,
+        batch_size=1,
+        num_workers=pl_module.hparams.config["num_workers"],
+        sampler=dist_sampler,
+        pin_memory=True,
+        collate_fn=functools.partial(image_dset.collate,
+                                     mlm_collator=pl_module.trainer.datamodule.dms[0].mlm_collator, ), )
+
+    # TODO: speed up the process by caching text/image features
+    text_preload = list()
+    for _b in tqdm.tqdm(text_loader, desc="text prefetch loop"):
+        # == Begin: Add New Keys ==
+        batch_text_preload = {
+            "text_ids": _b["text_ids"].to(pl_module.device),
+            "text_masks": _b["text_masks"].to(pl_module.device),
+            "text_labels": _b["text_labels"].to(pl_module.device),
+            "img_index": _b["img_index"],
+        }
+        text_preload.append(batch_text_preload)
+        # == End  : Add New Keys ==
+
+    tiids = list()
+    for pre in text_preload:
+        tiids += pre["img_index"]
+    tiids = torch.tensor(tiids)
+
+    image_preload = list()
+    for _b in tqdm.tqdm(image_loader, desc="image prefetch loop"):
+        image_preload.append((_b['image'][0], _b["img_index"][0]))
+
+    rank_scores = list()
+    rank_iids = list()
+
+    for img_batch in tqdm.tqdm(image_preload, desc="rank loop"):
+        _im, _iid = img_batch
+
+        img_batch_score = list()
+        for txt_batch in text_preload:
+            fblen = len(txt_batch["text_ids"])
+            im = _im.repeat(fblen, 1, 1, 1).to(device=txt_batch['text_ids'].device)
+
+            with torch.cuda.amp.autocast():
+                # == Begin: Add New Keys ==
+                batch_infer = {
+                    "text_ids": txt_batch["text_ids"],
+                    "text_masks": txt_batch["text_masks"],
+                    "text_labels": txt_batch["text_labels"],
+                }
+                score = pl_module.irtr_head(pl_module.infer(batch_infer, img=im, )["multi_modal_cls_feats"])[:, 0]
+                # == End  : Add New Keys ==
+
+            img_batch_score.append(score)
+
+        img_batch_score = torch.cat(img_batch_score)
+        rank_scores.append(img_batch_score.cpu().tolist())
+        rank_iids.append(_iid)
+
+    torch.distributed.barrier()
+    gather_rank_scores = all_gather(rank_scores)
+    gather_rank_iids = all_gather(rank_iids)
+
+    iids = torch.tensor(gather_rank_iids)
+    iids = iids.view(-1)
+    scores = torch.tensor(gather_rank_scores)
+    scores = scores.view(len(iids), -1)
+
+    topk10 = scores.topk(10, dim=1)
+    topk5 = scores.topk(5, dim=1)
+    topk1 = scores.topk(1, dim=1)
+    topk10_iids = tiids[topk10.indices]
+    topk5_iids = tiids[topk5.indices]
+    topk1_iids = tiids[topk1.indices]
+
+    tr_r10 = (iids.unsqueeze(1) == topk10_iids).float().max(dim=1)[0].mean()
+    tr_r5 = (iids.unsqueeze(1) == topk5_iids).float().max(dim=1)[0].mean()
+    tr_r1 = (iids.unsqueeze(1) == topk1_iids).float().max(dim=1)[0].mean()
+
+    topk10 = scores.topk(10, dim=0)
+    topk5 = scores.topk(5, dim=0)
+    topk1 = scores.topk(1, dim=0)
+    topk10_iids = iids[topk10.indices]
+    topk5_iids = iids[topk5.indices]
+    topk1_iids = iids[topk1.indices]
+
+    ir_r10 = (tiids.unsqueeze(0) == topk10_iids).float().max(dim=0)[0].mean()
+    ir_r5 = (tiids.unsqueeze(0) == topk5_iids).float().max(dim=0)[0].mean()
+    ir_r1 = (tiids.unsqueeze(0) == topk1_iids).float().max(dim=0)[0].mean()
+
+    return (ir_r1, ir_r5, ir_r10, tr_r1, tr_r5, tr_r10)
+
+
+def visualize_attention(image, text2image_attns, image2text_attns):
+    attention_map = text2image_attns[-1][0]  # 假设形状是 (B, H, W)
+    # attention_map = image2text_attns[-1].mean(dim=1)  # 平均所有注意力头
+    attention_map = attention_map[0, -3, :, :].cpu().detach().numpy()  # 选择第一个样本和第一个注意力头
+    # 首先，找到全为0的列
+    non_zero_columns = np.any(attention_map != 0, axis=0)
+
+    # 其次，保留非零列
+    attention_map = attention_map[:, non_zero_columns]
+    attention_map = attention_map[:attention_map.shape[1], :]
+
+    attention_map = torch.from_numpy(attention_map)
+
+    # 检查并调整维度，如果只有 2 维则添加批次和通道维度
+    if len(attention_map.shape) == 2:
+        attention_map = attention_map.unsqueeze(0).unsqueeze(0)  # 使其形状变为 (1, 1, H, W)
+    elif len(attention_map.shape) == 3:  # 如果是 (C, H, W) 则添加批次维度
+        attention_map = attention_map.unsqueeze(0)  # 使其形状变为 (1, C, H, W)
+
+    # 调整注意力图的大小以匹配图像
+    attn_map = F.interpolate(attention_map, size=image.shape[-2:], mode='bilinear',
+                             align_corners=False).squeeze()
+
+    # # 归一化注意力图
+    attn_map = attn_map.cpu().detach().numpy()
+    attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
+
+    image = image[:, 0, :, :]
+
+    # # 将注意力图叠加在图像上
+    plt.imshow(image.permute(1, 2, 0).cpu().numpy(), cmap='gray')
+    plt.imshow(attn_map, cmap='jet', alpha=0.5)  # 调整 alpha 以控制透明度
+    plt.axis('off')
+    plt.show()
+
+# Example usage:
+# Assuming `image` is a tensor of shape (C, H, W)
+# visualize_attention(image, ret["attentions"]["text2image_attns"], ret["attentions"]["image2text_attns"])
+
+==> m3ae/modules/position_embeddings.py <==
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+# --------------------------------------------------------
+# Position embedding utils
+# --------------------------------------------------------
+
+import numpy as np
+
+import torch
+
+
+# --------------------------------------------------------
+# 2D sine-cosine position embedding
+# References:
+# Transformer: https://github.com/tensorflow/models/blob/master/official/nlp/transformer/model_utils.py
+# MoCo v3: https://github.com/facebookresearch/moco-v3
+# --------------------------------------------------------
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
+    """
+    grid_size: int of the grid height and width
+    return:
+    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
+
+    grid = grid.reshape([2, 1, grid_size, grid_size])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    if cls_token:
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    return pos_embed
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000 ** omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
+
+# --------------------------------------------------------
+# Interpolate position embeddings for high-resolution
+# References:
+# DeiT: https://github.com/facebookresearch/deit
+# --------------------------------------------------------
+def interpolate_pos_embed(model, checkpoint_model):
+    if 'pos_embed' in checkpoint_model:
+        pos_embed_checkpoint = checkpoint_model['pos_embed']
+        embedding_size = pos_embed_checkpoint.shape[-1]
+        num_patches = model.patch_embed.num_patches
+        num_extra_tokens = model.pos_embed.shape[-2] - num_patches
+        # height (== width) for the checkpoint position embedding
+        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
+        # height (== width) for the new position embedding
+        new_size = int(num_patches ** 0.5)
+        # class_token and dist_token are kept unchanged
+        if orig_size != new_size:
+            print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+            # only the position tokens are interpolated
+            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+            pos_tokens = torch.nn.functional.interpolate(
+                pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+            checkpoint_model['pos_embed'] = new_pos_embed
+
+==> m3ae/modules/prediction_heads.py <==
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers.models.bert.modeling_bert import BertPredictionHeadTransform
+
+from m3ae.modules.position_embeddings import get_2d_sincos_pos_embed
+from m3ae.modules.vision_encoders.clip_model import Transformer, LayerNorm
+
+
+class Pooler(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.dense = nn.Linear(hidden_size, hidden_size)
+        self.activation = nn.Tanh()
+        self.attn_score = nn.Linear(hidden_size, 1)
+        self.attn_gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, hidden_states):
+        first_token_tensor = hidden_states[:, 0]
+        if hidden_states.size(1) > 1:
+            weights = F.softmax(self.attn_score(hidden_states), dim=1)
+            attn_pooled = torch.sum(weights * hidden_states, dim=1)
+            combined = first_token_tensor + torch.tanh(self.attn_gate) * attn_pooled
+        else:
+            combined = first_token_tensor
+        pooled_output = self.dense(combined)
+        pooled_output = self.activation(pooled_output)
+        return pooled_output
+
+
+class MLMHead(nn.Module):
+    def __init__(self, config, weight=None):
+        super().__init__()
+        self.transform = BertPredictionHeadTransform(config)
+        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
+        if weight is not None:
+            self.decoder.weight = weight
+
+    def forward(self, x):
+        x = self.transform(x)
+        x = self.decoder(x) + self.bias
+        return x
+
+
+class MIMHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config["hidden_size"]
+        self.patch_size = config["patch_size"]
+        self.num_patches = (config["image_size"] // config["patch_size"]) ** 2
+        self.decoder_hidden_size = config["mim_decoder_hidden_size"]
+        self.decoder_num_layers = config["mim_decoder_num_layers"]
+        self.decoder_num_heads = config["mim_decoder_num_heads"]
+        self.decoder_num_channels = 3 * config["patch_size"] ** 2
+
+        self.decoder_embed = nn.Linear(self.hidden_size, self.decoder_hidden_size, bias=True)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.decoder_hidden_size))
+        torch.nn.init.normal_(self.mask_token, std=.02)
+
+        self.decoder_pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_patches + 1, self.decoder_hidden_size),
+            requires_grad=False
+        )
+        decoder_pos_embed = get_2d_sincos_pos_embed(
+            self.decoder_hidden_size, int(self.num_patches ** .5), True
+        )
+        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
+
+        self.decoder = Transformer(self.decoder_hidden_size, self.decoder_num_layers + 1, self.decoder_num_heads)
+        self.decoder_norm = LayerNorm(self.decoder_hidden_size)
+        self.decoder_pred = nn.Linear(self.decoder_hidden_size, self.patch_size ** 2 * 3, bias=True)
+
+    def forward(self, x, ids_restore):
+        x = self.decoder_embed(x)
+
+        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
+        x = torch.cat([x[:, :1, :], x_], dim=1)
+
+        x = x + self.decoder_pos_embed.to(x.dtype)
+
+        x = x.permute(1, 0, 2)
+        x = self.decoder(x)
+        x = x.permute(1, 0, 2)
+        x = self.decoder_norm(x)
+
+        x = self.decoder_pred(x)
+        x = x[:, 1:, :]
+        return x
+
+
+class ITMHead(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.fc = nn.Linear(hidden_size, 2)
+
+    def forward(self, x):
+        x = self.fc(x)
+        return x
